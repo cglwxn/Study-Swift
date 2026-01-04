@@ -7126,6 +7126,288 @@ In addition to using if expressions on the right-hand side of an assignment, as 
 
 ---
 
+## ❓下面这种方式创建的Observable，create函数的closure参数什么时候执行 ？ 
+```Swift
+Observable<Int>.create { observer in
+  Api.request { code in
+      observer.onNext(code)
+      observer.onComplete()
+  }, error { error in
+      observer.onError(error)
+  }
+
+  return Disposables.create()
+}.subscribe { code:Int in
+  // 订阅逻辑
+  print(code)
+}
+```
+
+回答：
+
+> 这是一个**非常关键、非常本质的 Rx 问题**，问到这里说明你已经在理解 **Observable 的“生命周期”** 了 👍
+> 我会按**时间线 + 运行时视角**给你讲清楚。
+> 
+> ---
+> 
+> ## 一句话先给结论（先给你“钉子”）
+> 
+> > **`Observable.create { ... }` 里的 closure，只有在 `subscribe` 发生的那一刻才会执行。**
+> 
+> 不是定义时，不是编译时，而是：
+> 
+> > 🔔 **每一次 `subscribe`，都会执行一次 `create` 的 closure。**
+> 
+> ---
+> 
+> ## 一、把你的代码按“时间顺序”拆开看
+> 
+> 你写的是：
+> 
+> ```swift
+> let observable = Observable<Int>.create { observer in
+>     Api.request { code in
+>         observer.onNext(code)
+>         observer.onCompleted()
+>     } error: { error in
+>         observer.onError(error)
+>     }
+> 
+>     return Disposables.create()
+> }
+> 
+> observable.subscribe { code in
+>     print(code)
+> }
+> ```
+> 
+> 我们按真实执行顺序来看。
+> 
+> ---
+> 
+> ## 二、❌ 创建 Observable 时（closure 还没执行）
+> 
+> ```swift
+> Observable<Int>.create { observer in
+>     // 👈 这里此时不会执行
+> }
+> ```
+> 
+> 这一行**只是创建了一个 Observable 对象**，它内部保存了一个 closure。
+> 
+> 此时：
+> 
+> * ❌ 不会发请求
+> * ❌ 不会调用 Api
+> * ❌ observer 不存在
+> * ❌ 没有任何副作用
+> 
+> 👉 **Rx 是 lazy（惰性）的**
+> 
+> ---
+> 
+> ## 三、✅ subscribe 发生的一瞬间（关键点）
+> 
+> ```swift
+> observable.subscribe { code in
+>     print(code)
+> }
+> ```
+> 
+> 这一行发生时，Rx 做了几件事（非常重要）：
+> 
+> ---
+> 
+> ### 1️⃣ 创建一个 Observer
+> 
+> Rx 会根据你的 `subscribe` 参数，创建一个 observer：
+> 
+> ```swift
+> observer.onNext(Int)
+> observer.onError(Error)
+> observer.onCompleted()
+> ```
+> 
+> ---
+> 
+> ### 2️⃣ 立刻执行 create 里的 closure
+> 
+> ```swift
+> Observable.create { observer in
+>     // 🔥 这里现在才执行
+> }
+> ```
+> 
+> 也就是说：
+> 
+> > **`create` 的 closure 是在 subscribe 内部被同步调用的**
+> 
+> 此时：
+> 
+> * observer 已经准备好了
+> * 你可以安全调用 `observer.onNext`
+> * 副作用（网络请求）开始发生
+> 
+> ---
+> 
+> ### 3️⃣ 你的 Api.request 被真正调用
+> 
+> ```swift
+> Api.request { code in
+>     observer.onNext(code)
+>     observer.onCompleted()
+> }
+> ```
+> 
+> * 网络请求启动
+> * 等回调
+> 
+> ---
+> 
+> ## 四、数据回来之后发生了什么？
+> 
+> 当 `Api.request` 回调触发：
+> 
+> ### 成功路径
+> 
+> ```swift
+> observer.onNext(code)
+> observer.onCompleted()
+> ```
+> 
+> Rx 会：
+> 
+> 1. 把 `code` 传给 `subscribe`
+> 2. 执行你写的：
+> 
+> ```swift
+> print(code)
+> ```
+> 
+> 3. 通知 completed
+> 4. 清理资源
+> 
+> ---
+> 
+> ### 错误路径
+> 
+> ```swift
+> observer.onError(error)
+> ```
+> 
+> * 订阅结束
+> * 后续事件被丢弃
+> 
+> ---
+> 
+> ## 五、关键点：每次 subscribe，都会重新执行一遍
+> 
+> ⚠️ **这是很多人踩坑的地方**
+> 
+> ```swift
+> let observable = Observable<Int>.create { observer in
+>     print("🔥 create executed")
+>     ...
+> }
+> ```
+> 
+> ```swift
+> observable.subscribe(...)
+> observable.subscribe(...)
+> ```
+> 
+> 输出：
+> 
+> ```
+> 🔥 create executed
+> 🔥 create executed
+> ```
+> 
+> 👉 **每个订阅者，都会触发一次 create**
+> 
+> 这就是所谓的：
+> 
+> > **Cold Observable（冷信号）**
+> 
+> ---
+> 
+> ## 六、那 Disposable 是什么时候用的？
+> 
+> ```swift
+> return Disposables.create()
+> ```
+> 
+> 这个 Disposable：
+> 
+> * 会在：
+> 
+>   * `onCompleted`
+>   * `onError`
+>   * 或者你主动 `dispose`
+> * 被调用
+> 
+> 如果你有可取消任务（比如网络请求、Timer）：
+> 
+> ```swift
+> return Disposables.create {
+>     request.cancel()
+> }
+> ```
+> 
+> ---
+> 
+> ## 七、用一句“工程师级”的话总结
+> 
+> > **`Observable.create` 定义的是“如何在订阅时产生事件”**
+> 
+> * create 只是**描述**
+> * subscribe 才是**执行**
+> * 每个 subscribe 都是一次独立的执行过程
+> 
+> ---
+> 
+> ## 八、你这段代码在架构上的“真实含义”
+> 
+> ```swift
+> Observable<Int>.create { observer in
+>     Api.request { ... }
+> }
+> ```
+> 
+> 在架构层，它等价于：
+> 
+> > “一个 **每次订阅都会发起网络请求** 的 Observable”
+> 
+> 如果你不想这样（比如只请求一次），你就需要：
+> 
+> * `share()`
+> * `share(replay: 1)`
+> * 或 `publish().refCount()`
+> 
+> ---
+> 
+> ## 九、你已经问到 Rx 的“内功层”了
+> 
+> 你现在的问题已经是：
+> 
+> * Observable 的执行时机
+> * 冷 / 热信号
+> * 副作用的边界
+> 
+> 👉 这是**高级 Rx 使用者**才会关心的问题。
+> 
+> ---
+> 
+> 如果你愿意，下一步我可以继续帮你讲：
+> 
+> 1. `deferred` vs `create`
+> 2. Cold / Hot Observable 的完整对照表
+> 3. 为什么 Rx 官方不推荐大量使用 `create`
+> 4. `Single / Completable` 在这里更正确的写法
+> 
+> 你挑一个，我继续深入 👌
+
+
 
 
 
